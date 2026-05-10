@@ -11,18 +11,9 @@ It scans every `.claude/worktrees/<name>` directory under `$SITES_ROOT` (default
 
 …and gives you one place to list, filter, preview, launch, prune, and bulk-restore those worktrees.
 
-```
-agent-plugins
-● ancient-twirling-taco         worktree-ancient-twirling-taco            0m commit  18m edit  clean  PR#757 OPEN
-● quiet-hopping-honey           issue-786-rq-gate-lint-shellcheck-…       4m commit  54m edit  clean  PR#788 merged
-  inherited-tickling-bentley    worktree-inherited-tickling-bentley     22h commit  18h edit  clean  no-PR
-  fix-519                       fix/519-humans-safe-scheduler            5d commit   5d edit  clean  PR#636 merged
+![wt TUI: multi-select picker on the left, rich preview on the right](docs/wt-tui.png)
 
-arqu-web
-  public-client                 fix/lucidrisq-web-public-client          2w commit   2w edit  DIRTY  PR#3471 merged
-```
-
-Green ● = a tmux pane lives in that worktree. Orange ● = `claude` is running there.
+🟢 = a tmux pane lives in that worktree. 🟠 = `claude` is running there.
 
 ## Why
 
@@ -121,8 +112,8 @@ The default view (used by `list`, `pick`, fzf TUI) hides rows that are clean + n
 | `clean`      | working tree matches HEAD and no untracked files |
 | `PR#NNN OPEN/MERGED/CLOSED` | from cached `gh pr list --head <branch>` |
 | `no-PR`      | branch has no matching PR in the org |
-| green ●      | tmux has at least one pane whose `pane_current_path` is the worktree (or under it) |
-| orange ●     | a `claude` process is alive somewhere in that pane's process subtree |
+| 🟢           | tmux has at least one pane whose `pane_current_path` is the worktree (or under it) |
+| 🟠           | a `claude` process is alive somewhere in that pane's process subtree |
 
 ### Pruning rules
 
