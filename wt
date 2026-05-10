@@ -1,0 +1,909 @@
+#!/usr/bin/env bash
+# wt — list .claude/worktrees across ~/Sites with dirty + PR status,
+# and relaunch a chosen worktree in a tmux session running claude with
+# --dangerously-skip-permissions --remote-control.
+#
+# Usage:
+#   wt                # interactive picker (fzf if available)
+#   wt list           # print table only
+#   wt all            # include worktrees with no PR + clean
+#   wt prune          # remove merged or stale (>7d, no open PR) worktrees, with confirm
+#   wt prune --yes    # same, no prompt (still skips dirty)
+#   wt prune --force  # also remove dirty (asks for each)
+#   wt <substring>    # auto-pick first match (branch or path), launch tmux
+#
+# Flags (any subcommand):
+#   --refresh / -R    invalidate the gh PR cache for this run
+#   --no-cache        bypass cache entirely
+#
+# Env:
+#   WT_CACHE_TTL=600  cache freshness in seconds
+#   WT_GH_ORG=arqu-co GitHub org for PR lookups
+#   WT_CACHE_DIR=~/.cache/wt
+
+set -euo pipefail
+
+ROOT="${SITES_ROOT:-$HOME/Sites}"
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+LAUNCH_FLAGS=(--dangerously-skip-permissions --remote-control)
+CACHE_DIR="${WT_CACHE_DIR:-$HOME/.cache/wt}"
+CACHE_TTL="${WT_CACHE_TTL:-600}"   # seconds
+GH_ORG="${WT_GH_ORG:-arqu-co}"
+REFRESH=0
+mkdir -p "$CACHE_DIR"
+
+# Snapshot live tmux state once: name|path|cmd|pid lines, one per pane.
+# pane_current_command is the foreground process name (e.g. "claude", "zsh").
+# Used to flag a worktree as "live" (tmux pane in path) and "claude" (claude running).
+TMUX_PANES=$(tmux list-panes -a -F '#{session_name}|#{pane_current_path}|#{pane_current_command}|#{pane_pid}' 2>/dev/null || true)
+TMUX_SESSIONS=$(tmux ls -F '#{session_name}' 2>/dev/null || true)
+
+# Return "prs" / "issue" / empty depending on whether $1 has rq binding metadata.
+# Looks at the worktree's own .quality/session-prs.json AND HOME-side rq state.
+worktree_is_bound() {
+  local path="$1" branch
+  if [[ -f "$path/.quality/session-prs.json" ]] \
+     && grep -q '"#[0-9]' "$path/.quality/session-prs.json" 2>/dev/null; then
+    echo prs; return 0
+  fi
+  branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+  if [[ -n "$branch" ]]; then
+    # rq uses several slug formats (agent__plugins, arqu-co__agent-plugins,
+    # arqu-co-agent-plugins, …). Glob across all of them.
+    local hit
+    hit=$(compgen -G "$HOME/.claude/state/*/${branch}/rq/branch-issue.json" 2>/dev/null | head -1)
+    [[ -n "$hit" ]] && { echo issue; return 0; }
+  fi
+  return 0
+}
+
+# Set of pids that have a `claude` process anywhere in their subtree.
+# Computed by collecting all claude pids and walking up via ppid.
+CLAUDE_ANCESTORS=$(
+  ps -axo pid=,ppid=,command= 2>/dev/null | awk '
+    {
+      pid=$1; ppid=$2;
+      cmd=$0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", cmd);
+      parent[pid]=ppid;
+      if (cmd ~ /(^|\/)claude([ ]|$)/) claude[pid]=1;
+    }
+    END {
+      for (c in claude) {
+        p = c
+        while (p != "" && p != "0" && p != "1") {
+          mark[p] = 1
+          p = parent[p]
+          if (p == "") break
+        }
+      }
+      for (k in mark) print k
+    }
+  ' | tr '\n' ' '
+)
+
+# One gh call per repo (cached). Builds a lookup file the row loop greps.
+ensure_pr_cache() {
+  local repo="$1"
+  local f="$CACHE_DIR/$repo.tsv"
+  if [[ "$REFRESH" != "1" && -f "$f" ]]; then
+    local age now
+    now=$(date +%s)
+    age=$(( now - $(stat -f %m "$f" 2>/dev/null || echo 0) ))
+    (( age < CACHE_TTL )) && return 0
+  fi
+  # branch<TAB>number<TAB>state
+  gh -R "$GH_ORG/$repo" pr list --state all --limit 300 \
+    --json number,state,headRefName \
+    --jq '.[] | [.headRefName, (.number|tostring), .state] | @tsv' \
+    > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || : > "$f"
+}
+
+lookup_pr() {
+  local repo="$1" branch="$2"
+  local f="$CACHE_DIR/$repo.tsv"
+  [[ -f "$f" ]] || { echo $'\t'; return; }
+  awk -F'\t' -v b="$branch" '$1==b {print $2"\t"$3; exit}' "$f"
+}
+
+# colors
+if [[ -t 1 ]]; then
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YLW=$'\e[33m'
+  C_BLU=$'\e[34m'; C_MAG=$'\e[35m'; C_CYN=$'\e[36m'
+  C_ORG=$'\e[38;5;208m'
+  C_DIM=$'\e[2m'; C_BLD=$'\e[1m'; C_RST=$'\e[0m'
+else
+  C_RED= C_GRN= C_YLW= C_BLU= C_MAG= C_CYN= C_ORG= C_DIM= C_BLD= C_RST=
+fi
+
+# Collect rows: repo|wt_name|path|branch|dirty|pr_num|pr_state|commit_ts|mtime
+collect() {
+  local -a paths=()
+  local -A repos_seen=()
+  while IFS= read -r -d '' p; do paths+=("$p"); done < <(
+    find "$ROOT" -type d -path "*/.claude/worktrees/*" -prune -mindepth 4 -maxdepth 4 -print0 2>/dev/null
+  )
+
+  # First pass: find repos and fan out cache fills in parallel
+  local p repo
+  for p in "${paths[@]}"; do
+    repo="${p#$ROOT/}"
+    repo="${repo%%/.claude/worktrees/*}"
+    repos_seen[$repo]=1
+  done
+  local -a pids=()
+  for repo in "${!repos_seen[@]}"; do
+    ensure_pr_cache "$repo" &
+    pids+=($!)
+  done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+  # Second pass: emit rows using cached lookups (parallel git ops)
+  emit_row() {
+    local p="$1"
+    local repo wt_name branch dirty commit_ts mtime pr pr_num pr_state
+    repo="${p#$ROOT/}"
+    repo="${repo%%/.claude/worktrees/*}"
+    wt_name="${p##*/}"
+    [[ -d "$p/.git" || -f "$p/.git" ]] || return 0
+    branch=$(git -C "$p" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+    if git -C "$p" diff --quiet --ignore-submodules HEAD -- 2>/dev/null \
+       && [[ -z "$(git -C "$p" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+      dirty=0
+    else
+      dirty=1
+    fi
+    commit_ts=$(git -C "$p" log -1 --format=%ct 2>/dev/null || echo 0)
+    mtime=$(stat -f %m "$p" 2>/dev/null || echo 0)
+    pr=$(lookup_pr "$repo" "$branch")
+    pr_num="${pr%%$'\t'*}"
+    pr_state="${pr##*$'\t'}"
+    [[ "$pr_num" == "$pr_state" ]] && { pr_num=""; pr_state=""; }
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+      "$repo" "$wt_name" "$p" "$branch" "$dirty" "$pr_num" "$pr_state" "$commit_ts" "$mtime"
+  }
+  export -f emit_row lookup_pr
+  export ROOT CACHE_DIR
+  printf '%s\0' "${paths[@]}" | xargs -0 -n1 -P8 bash -c 'emit_row "$0"' || true
+}
+
+# Pretty-print a unix epoch age relative to now: 3h, 2d, 3w, 5mo, 1y
+fmt_age() {
+  local ts="$1" now="${2:-$(date +%s)}"
+  [[ -z "$ts" || "$ts" == "0" ]] && { printf '   -'; return; }
+  local diff=$(( now - ts ))
+  (( diff < 0 )) && diff=0
+  if   (( diff < 3600 ));     then printf '%3dm' $(( diff/60 ))
+  elif (( diff < 86400 ));    then printf '%3dh' $(( diff/3600 ))
+  elif (( diff < 86400*14 )); then printf '%3dd' $(( diff/86400 ))
+  elif (( diff < 86400*60 )); then printf '%3dw' $(( diff/(86400*7) ))
+  elif (( diff < 86400*365 ));then printf '%2dmo' $(( diff/(86400*30) ))
+  else printf '%3dy' $(( diff/(86400*365) ))
+  fi
+}
+
+# Truncate a string to N chars with an ellipsis.
+trunc() {
+  local s="$1" n="$2"
+  if (( ${#s} > n )); then
+    printf '%s…' "${s:0:n-1}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# Render one indented worktree row. No repo column (caller emits a header).
+# `state` is "claude" (orange ●), "tmux" (green ●), or "" (no marker).
+format_row() {
+  local wt_name="$1" branch="$2" dirty="$3" pr_num="$4" pr_state="$5"
+  local commit_ts="$6" mtime="$7" now="${8:-$(date +%s)}" state="${9:-}"
+  local dirty_lbl pr_lbl age_c age_m marker
+  if [[ "$dirty" == "1" ]]; then
+    dirty_lbl="${C_RED}${C_BLD}DIRTY${C_RST}"
+  else
+    dirty_lbl="${C_DIM}clean${C_RST}"
+  fi
+  case "$pr_state" in
+    OPEN)   pr_lbl="${C_GRN}${C_BLD}PR#${pr_num} OPEN${C_RST}" ;;
+    MERGED) pr_lbl="${C_MAG}PR#${pr_num} merged${C_RST}" ;;
+    CLOSED) pr_lbl="${C_DIM}PR#${pr_num} closed${C_RST}" ;;
+    "")     pr_lbl="${C_DIM}no-PR${C_RST}" ;;
+    *)      pr_lbl="${C_YLW}PR#${pr_num} ${pr_state}${C_RST}" ;;
+  esac
+  age_c=$(fmt_age "$commit_ts" "$now")
+  age_m=$(fmt_age "$mtime" "$now")
+  case "$state" in
+    claude) marker="${C_ORG}${C_BLD}●${C_RST}" ;;
+    tmux)   marker="${C_GRN}${C_BLD}●${C_RST}" ;;
+    *)      marker=" " ;;
+  esac
+  local wt_t br_t
+  wt_t=$(trunc "$wt_name" 28)
+  br_t=$(trunc "$branch" 38)
+  printf '%s %s%-28s%s  %-38s  %s commit %s edit  %-5s  %s' \
+    "$marker" "$C_BLU" "$wt_t" "$C_RST" "$br_t" \
+    "$age_c" "$age_m" "$dirty_lbl" "$pr_lbl"
+}
+
+session_name() {
+  local repo="$1" wt_name="$2"
+  printf 'wt-%s-%s' "$repo" "$wt_name" | tr '/' '-' | tr -c 'a-zA-Z0-9-' '-' | cut -c1-60
+}
+
+session_active() {
+  local sess="$1"
+  [[ -z "$TMUX_SESSIONS" ]] && return 1
+  printf '%s\n' "$TMUX_SESSIONS" | grep -Fxq "$sess"
+}
+
+# Return tmux session name(s) whose pane cwd is the worktree path or under it.
+# Empty if none.
+session_for_path() {
+  local path="$1"
+  [[ -z "$TMUX_PANES" ]] && return 0
+  awk -F'|' -v p="$path" '
+    BEGIN { plen = length(p) }
+    {
+      cwd = $2
+      if (cwd == p || substr(cwd, 1, plen+1) == p"/") {
+        if (!seen[$1]++) print $1
+      }
+    }
+  ' <<<"$TMUX_PANES"
+}
+
+# Returns "claude" if a claude process is running in any pane in the path;
+# "tmux" if there's a pane but no claude; "" if no pane.
+# Detection: walk descendants of pane_pid via pgrep and look for "claude".
+session_state_for_path() {
+  local path="$1"
+  [[ -z "$TMUX_PANES" ]] && return 0
+  local has_pane=0 found_claude=0 sname cwd cmd pid
+  while IFS='|' read -r sname cwd cmd pid; do
+    [[ -z "$cwd" ]] && continue
+    if [[ "$cwd" == "$path" || "$cwd" == "$path"/* ]]; then
+      has_pane=1
+      if [[ " $CLAUDE_ANCESTORS " == *" $pid "* ]]; then
+        found_claude=1; break
+      fi
+    fi
+  done <<<"$TMUX_PANES"
+  if (( found_claude )); then echo claude
+  elif (( has_pane )); then echo tmux
+  fi
+}
+
+launch() {
+  local path="$1" repo="$2" wt_name="$3"
+  local sess existing
+  # Prefer an already-running session whose cwd is in the worktree.
+  existing=$(session_for_path "$path" | head -1)
+  if [[ -n "$existing" ]]; then
+    sess="$existing"
+    echo "Attaching live session: $sess"
+  else
+    sess=$(session_name "$repo" "$wt_name")
+    if tmux has-session -t "$sess" 2>/dev/null; then
+      echo "Attaching existing session: $sess"
+    else
+      echo "Starting session: $sess"
+      tmux new-session -d -s "$sess" -c "$path" "$CLAUDE_BIN ${LAUNCH_FLAGS[*]}"
+    fi
+  fi
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$sess"
+  else
+    tmux attach -t "$sess"
+  fi
+}
+
+usage() {
+  cat <<EOF
+wt — list and launch .claude/worktrees across \$SITES_ROOT (${ROOT})
+
+USAGE
+  wt [flags] [substr...]            interactive picker (fzf if available)
+  wt list [flags] [substr...]       print grouped table
+  wt all  [flags] [substr...]       picker including no-PR + clean
+  wt restore [--bound] [--open-prs]
+             [-n|--dry-run]         reattach detached tmux sessions in iTerm
+                                    tabs, then open new tabs for rq-bound
+                                    worktrees not already in tmux. --bound
+                                    keeps only worktrees with rq metadata
+                                    (PR or issue binding). --open-prs only
+                                    those with an OPEN PR.
+  wt prune [--yes|-y] [--force|-f]  remove merged, stale (>7d, no open PR),
+                                    or clean+no-PR+no-live-session worktrees.
+                                    Skips any worktree with a live tmux/claude
+                                    session. Removes MERGED dirty (work landed);
+                                    --force also removes other dirty.
+  wt -h | --help                    this help
+
+  Positional substrings filter rows by repo|worktree|branch (AND across all).
+  In pick mode, if exactly one row matches, it auto-launches.
+
+FILTER FLAGS
+      --repo <name>         only show worktrees in repos matching <name>
+      --claude              only rows with a running Claude
+      --tmux                only rows with a running tmux session (any kind)
+      --dirty               only dirty worktrees
+      --open                only worktrees with an OPEN PR
+
+OUTPUT FLAGS (list only)
+      --json                emit JSON array (requires jq)
+      --tsv                 emit tab-separated rows with header
+
+FLAGS (any subcommand)
+  -R, --refresh             invalidate the gh PR cache for this run
+      --no-cache            bypass cache entirely
+  -h, --help                show help
+
+LAUNCH BEHAVIOR
+  Picks a worktree, then runs:
+    tmux new-session -d -s wt-<repo>-<wt> -c <path> \\
+        ${CLAUDE_BIN} ${LAUNCH_FLAGS[*]}
+  and attaches (or switches if already inside tmux).
+
+ENV
+  SITES_ROOT      root of repos                 (default: \$HOME/Sites)
+  CLAUDE_BIN      claude binary                  (default: claude)
+  WT_GH_ORG       GitHub org for PR lookups     (default: arqu-co)
+  WT_CACHE_DIR    cache directory               (default: \$HOME/.cache/wt)
+  WT_CACHE_TTL    cache freshness in seconds    (default: 600)
+
+EXAMPLES
+  wt                                  # pick a worktree, launch claude in tmux
+  wt list                             # print everything, grouped + sorted
+  wt list agent-plugins               # list rows where repo|wt|branch contains "agent-plugins"
+  wt list --repo agent-plugins        # only the agent-plugins repo
+  wt list --claude                    # only rows with claude running
+  wt list --tmux                      # only rows with any tmux session
+  wt list --dirty                     # only dirty worktrees
+  wt list --open                      # only OPEN-PR worktrees
+  wt 758                              # launch first match for "758"
+  wt prune --yes                      # auto-remove merged + 7d-stale (skip dirty)
+  wt prune --force                    # ask about dirty ones too
+  wt -R list                          # refresh PR cache then print
+EOF
+}
+
+# Render a rich preview of a single worktree for fzf's preview pane.
+# Args: $1=path. Tries to be resilient — best effort, never fails.
+preview_worktree() {
+  local path="$1"
+  [[ -z "$path" ]] && return 0
+  local repo branch wt_name
+  repo="${path#$ROOT/}"; repo="${repo%%/.claude/worktrees/*}"
+  wt_name="${path##*/}"
+  branch=$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+
+  local cyn=$'\e[36m' grn=$'\e[32m' ylw=$'\e[33m' red=$'\e[31m'
+  local mag=$'\e[35m' org=$'\e[38;5;208m' dim=$'\e[2m' bld=$'\e[1m' rst=$'\e[0m'
+
+  printf '%s%s%s%s/%s%s%s\n' "$bld" "$cyn" "$repo" "$rst" "$bld" "$wt_name" "$rst"
+  printf '%sbranch%s  %s\n' "$dim" "$rst" "$branch"
+  printf '%spath%s    %s\n' "$dim" "$rst" "$path"
+
+  # PR (from cache)
+  local pr_line pr_num pr_state
+  pr_line=$(awk -F'\t' -v b="$branch" '$1==b {print; exit}' \
+            "$CACHE_DIR/$repo.tsv" 2>/dev/null)
+  if [[ -n "$pr_line" ]]; then
+    IFS=$'\t' read -r _ pr_num pr_state <<<"$pr_line"
+    local color="$dim"
+    case "$pr_state" in
+      OPEN)   color="$grn$bld" ;;
+      MERGED) color="$mag" ;;
+      CLOSED) color="$dim" ;;
+    esac
+    printf '%spr%s      %sPR#%s %s%s\n' "$dim" "$rst" "$color" "$pr_num" "$pr_state" "$rst"
+    printf '%s        %shttps://github.com/%s/%s/pull/%s%s\n' \
+      "$dim" "$dim" "$GH_ORG" "$repo" "$pr_num" "$rst"
+  else
+    printf '%spr%s      %sno PR%s\n' "$dim" "$rst" "$dim" "$rst"
+  fi
+
+  # Status: live tmux/claude
+  local panes
+  panes=$(tmux list-panes -a -F '#{session_name}|#{pane_current_path}|#{pane_current_command}|#{pane_pid}' 2>/dev/null \
+          | awk -F'|' -v p="$path" 'index($2, p)==1 { print }')
+  if [[ -n "$panes" ]]; then
+    # Recompute claude ancestor set inline; preview is a subprocess.
+    local claude_anc
+    claude_anc=$(ps -axo pid=,ppid=,command= 2>/dev/null | awk '
+      { pid=$1; ppid=$2; cmd=$0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]+/, "", cmd);
+        parent[pid]=ppid; if (cmd ~ /(^|\/)claude([ ]|$)/) claude[pid]=1 }
+      END { for (c in claude) { p=c; while(p!=""&&p!="0"&&p!="1") {mark[p]=1; p=parent[p]; if(p=="")break} }
+            for (k in mark) print k }' | tr '\n' ' ')
+    printf '\n%stmux%s\n' "$bld" "$rst"
+    while IFS='|' read -r sname cwd cmd pid; do
+      local marker="${grn}●${rst}"
+      [[ " $claude_anc " == *" $pid "* ]] && marker="${org}●${rst}"
+      printf '  %s %s%s%s  pane:%s  cwd:%s%s%s\n' \
+        "$marker" "$cyn" "$sname" "$rst" "$cmd" "$dim" "${cwd#$path}" "$rst"
+    done <<<"$panes"
+  fi
+
+  # Recent commits
+  printf '\n%scommits%s\n' "$bld" "$rst"
+  git -C "$path" log -5 --color=always --format='  %C(yellow)%h%C(reset) %s %C(dim)(%cr)%C(reset)' 2>/dev/null \
+    | sed "s/$/$rst/"
+
+  # Dirty files
+  local dirty_lines dirty_count
+  dirty_lines=$(git -C "$path" status --porcelain 2>/dev/null || true)
+  dirty_count=$(printf '%s' "$dirty_lines" | awk 'NF{c++} END{print c+0}')
+  if (( dirty_count > 0 )); then
+    printf '\n%sdirty%s (%d)\n' "$red$bld" "$rst" "$dirty_count"
+    printf '%s\n' "$dirty_lines" | head -20 | sed "s/^/  /"
+    (( dirty_count > 20 )) && printf '  %s… +%d more%s\n' "$dim" $((dirty_count-20)) "$rst"
+  fi
+
+  # Latest claude transcript turn
+  local slug proj_dir latest
+  slug=$(echo "$path" | sed 's|/|-|g; s|\.|-|g')
+  proj_dir="$HOME/.claude/projects/$slug"
+  if [[ -d "$proj_dir" ]]; then
+    latest=$(ls -t "$proj_dir"/*.jsonl 2>/dev/null | head -1)
+    if [[ -n "$latest" ]] && command -v jq >/dev/null 2>&1; then
+      printf '\n%slast claude turns%s  %s%s%s\n' \
+        "$bld" "$rst" "$dim" "$(basename "$latest")" "$rst"
+      { tail -200 "$latest" 2>/dev/null \
+          | jq -r 'select(.type=="user" or .type=="assistant")
+                   | (.type[0:1]) + ": " +
+                     ( if (.message.content|type)=="string" then .message.content
+                       elif (.message.content|type)=="array" then
+                         ([.message.content[]
+                           | if .type=="text" then .text
+                             elif .type=="tool_use" then "[tool:" + .name + "]"
+                             elif .type=="tool_result" then "[tool-result]"
+                             else "" end] | join(" "))
+                       else "" end )' 2>/dev/null \
+          | tail -8 \
+          | awk -v dim="$dim" -v rst="$rst" -v cyn="$cyn" -v grn="$grn" '
+              {
+                prefix=substr($0,1,1); rest=substr($0,4)
+                gsub(/\n/, " ", rest)
+                if (length(rest) > 240) rest = substr(rest,1,240) "…"
+                col = (prefix=="u") ? cyn : grn
+                print "  " col prefix rst " " rest
+              }'
+      } || true
+    fi
+  fi
+}
+
+# Confirm an action interactively.
+confirm() {
+  local prompt="$1" ans
+  read -rp "$prompt [y/N] " ans </dev/tty || ans=""
+  [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+# Render one fzf row from a pipe-delimited record. State is fetched per row.
+tui_render_rows() {
+  local rows="$1" now="$2" repo wt_name path branch dirty pr_num pr_state commit_ts mtime state line last_repo=""
+  printf '%s\n' "$rows" | while IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime; do
+    [[ -z "$repo" ]] && continue
+    state=$(session_state_for_path "$path")
+    # Repo column is fixed-width so fzf alignment stays clean even with multi-select.
+    line=$(printf '%s%-22s%s ' "$C_CYN" "$repo" "$C_RST"; \
+           format_row "$wt_name" "$branch" "$dirty" "$pr_num" "$pr_state" "$commit_ts" "$mtime" "$now" "$state")
+    # Trailing tab-delimited metadata block — hidden via --with-nth.
+    printf '%s\t%s\t%s\t%s\n' "$line" "$path" "$repo" "$wt_name"
+  done
+}
+
+# Drive the interactive picker. Multi-select + preview + key bindings.
+# Args: $1=rows, $2=now-epoch
+tui() {
+  local rows="$1" now="$2"
+  local rendered key out
+  local self="${BASH_SOURCE[0]:-$0}"
+
+  rendered=$(tui_render_rows "$rows" "$now")
+  if [[ -z "$rendered" ]]; then
+    echo "no worktrees" >&2
+    return
+  fi
+
+  while :; do
+    out=$(printf '%s\n' "$rendered" \
+      | fzf --ansi --multi \
+            --delimiter=$'\t' \
+            --with-nth=1 \
+            --preview "$self _preview {2}" \
+            --preview-window='right,55%,wrap,border-left' \
+            --prompt="wt> " \
+            --height=100% --reverse --no-mouse \
+            --header=$'enter:launch/attach   tab:multi-select   ctrl-o:open-all   ctrl-d:prune   ctrl-x:kill-tmux   ctrl-r:refresh   ctrl-/:toggle-preview' \
+            --bind='ctrl-/:toggle-preview' \
+            --expect=ctrl-o,ctrl-d,ctrl-x,ctrl-r) || return 0
+    [[ -z "$out" ]] && return 0
+
+    key=$(head -1 <<<"$out")
+    local picks
+    picks=$(tail -n +2 <<<"$out")
+    [[ -z "$picks" ]] && return 0
+
+    case "$key" in
+      ctrl-r)
+        REFRESH=1
+        for f in "$CACHE_DIR"/*.tsv; do rm -f "$f" 2>/dev/null; done
+        rows=$(collect | awk -F'|' '{print $1"\t"(-$8)"\t"$0}' | sort -k1,1 -k2,2n | cut -f3-)
+        rendered=$(tui_render_rows "$rows" "$(date +%s)")
+        continue
+        ;;
+      ctrl-d)
+        local n; n=$(printf '%s\n' "$picks" | wc -l | tr -d ' ')
+        if confirm "remove $n worktree(s)?"; then
+          while IFS=$'\t' read -r _ path repo wt_name; do
+            local repo_root="$ROOT/$repo"
+            git -C "$repo_root" worktree remove --force "$path" 2>&1 | sed 's/^/  /'
+          done <<<"$picks"
+        fi
+        rows=$(collect | awk -F'|' '{print $1"\t"(-$8)"\t"$0}' | sort -k1,1 -k2,2n | cut -f3-)
+        rendered=$(tui_render_rows "$rows" "$(date +%s)")
+        continue
+        ;;
+      ctrl-x)
+        # Kill tmux session(s) attached to selected worktree paths.
+        while IFS=$'\t' read -r _ path repo wt_name; do
+          local sessions sess
+          sessions=$(session_for_path "$path")
+          while IFS= read -r sess; do
+            [[ -z "$sess" ]] && continue
+            tmux kill-session -t "$sess" 2>&1 | sed 's/^/  /' || true
+            echo "  killed: $sess"
+          done <<<"$sessions"
+        done <<<"$picks"
+        # Refresh tmux snapshot for next iteration.
+        TMUX_PANES=$(tmux list-panes -a -F '#{session_name}|#{pane_current_path}|#{pane_current_command}|#{pane_pid}' 2>/dev/null || true)
+        TMUX_SESSIONS=$(tmux ls -F '#{session_name}' 2>/dev/null || true)
+        rendered=$(tui_render_rows "$rows" "$(date +%s)")
+        continue
+        ;;
+      ctrl-o|"")
+        # ctrl-o: open every selection in a new iTerm tab + tmux+claude.
+        # enter (no key): launch the focused (first) selection inline.
+        if [[ "$key" == "ctrl-o" ]]; then
+          while IFS=$'\t' read -r _ path repo wt_name; do
+            local sess existing
+            existing=$(session_for_path "$path" | head -1)
+            if [[ -n "$existing" ]]; then
+              sess="$existing"
+            else
+              sess=$(session_name "$repo" "$wt_name")
+              tmux has-session -t "$sess" 2>/dev/null \
+                || tmux new-session -d -s "$sess" -c "$path" "$CLAUDE_BIN ${LAUNCH_FLAGS[*]}"
+            fi
+            osascript <<EOF >/dev/null
+tell application "iTerm"
+  tell current window
+    create tab with default profile
+    tell current session to write text "tmux attach -t '$sess'"
+  end tell
+end tell
+EOF
+            echo "opened: $sess"
+          done <<<"$picks"
+          return 0
+        else
+          local first; first=$(head -1 <<<"$picks")
+          IFS=$'\t' read -r _ path repo wt_name <<<"$first"
+          launch "$path" "$repo" "$wt_name"
+          return 0
+        fi
+        ;;
+    esac
+  done
+}
+
+main() {
+  # Hidden helper used by fzf preview pane.
+  if [[ "${1:-}" == "_preview" ]]; then
+    shift
+    preview_worktree "$@"
+    return
+  fi
+
+  local -a args=()
+  local f_claude=0 f_tmux=0 f_dirty=0 f_open=0
+  local f_repo=""
+  PRUNE_OPTS=""
+  RESTORE_OPTS=""
+  FORMAT=""
+  while (( $# )); do
+    case "$1" in
+      -h|--help|help) usage; exit 0 ;;
+      --refresh|-R) REFRESH=1 ;;
+      --no-cache)   REFRESH=1; CACHE_TTL=0 ;;
+      --claude)     f_claude=1 ;;
+      --tmux)       f_tmux=1 ;;
+      --dirty)      f_dirty=1 ;;
+      --open)       f_open=1 ;;
+      --repo)       shift; f_repo="$1" ;;
+      --repo=*)     f_repo="${1#--repo=}" ;;
+      # prune/restore-specific flags — ferry through
+      --yes|-y|--force|-f|--dry-run|-n) PRUNE_OPTS+=" $1" ;;
+      --bound|--open-prs) RESTORE_OPTS+=" $1" ;;
+      --json) FORMAT=json ;;
+      --tsv)  FORMAT=tsv ;;
+      *) args+=("$1") ;;
+    esac
+    shift
+  done
+  set -- "${args[@]:-}"
+  local mode="${1:-pick}"
+  case "$mode" in list|pick|all|prune|restore) shift ;; *) mode="pick" ;; esac
+  local -a substrs=("$@")
+  local rows
+  rows=$(collect)
+  if [[ -z "$rows" ]]; then
+    echo "no worktrees found under $ROOT"
+    exit 0
+  fi
+
+  # Filter for default view: skip clean + no-PR + not-OPEN unless 'all'
+  local filtered
+  if [[ "$mode" == "all" ]]; then
+    filtered="$rows"
+  else
+    filtered=$(printf '%s\n' "$rows" | awk -F'|' '
+      { dirty=$5; pr=$6; state=$7
+        if (dirty=="1" || state=="OPEN" || state=="" || state=="MERGED" || state=="CLOSED") print
+      }')
+  fi
+
+  # Sort: repo asc, then commit_ts desc (most recent first)
+  local sorted now
+  now=$(date +%s)
+  sorted=$(printf '%s\n' "$filtered" | awk -F'|' '{print $1"\t"(-$8)"\t"$0}' | sort -k1,1 -k2,2n | cut -f3-)
+
+  # Apply user filters: --repo, --claude, --tmux, --dirty, --open, and any
+  # positional substrings (matched against repo|wt|branch).
+  if [[ -n "$f_repo" || ${#substrs[@]} -gt 0 || $f_claude == 1 || $f_tmux == 1 || $f_dirty == 1 || $f_open == 1 ]]; then
+    local kept=""
+    while IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime; do
+      [[ -z "$repo" ]] && continue
+      [[ -n "$f_repo" && "$repo" != *"$f_repo"* ]] && continue
+      [[ "$f_dirty" == "1" && "$dirty" != "1" ]] && continue
+      [[ "$f_open"  == "1" && "$pr_state" != "OPEN" ]] && continue
+      if [[ "$f_claude" == "1" || "$f_tmux" == "1" ]]; then
+        local st; st=$(session_state_for_path "$path")
+        [[ "$f_claude" == "1" && "$st" != "claude" ]] && continue
+        [[ "$f_tmux"   == "1" && "$st" != "claude" && "$st" != "tmux" ]] && continue
+      fi
+      if (( ${#substrs[@]} )); then
+        local hay="$repo|$wt_name|$branch" s ok=1
+        for s in "${substrs[@]}"; do
+          [[ "$hay" == *"$s"* ]] || { ok=0; break; }
+        done
+        (( ok )) || continue
+      fi
+      kept+="${repo}|${wt_name}|${path}|${branch}|${dirty}|${pr_num}|${pr_state}|${commit_ts}|${mtime}"$'\n'
+    done <<<"$sorted"
+    sorted="${kept%$'\n'}"
+  fi
+  if [[ -z "$sorted" ]]; then
+    echo "no worktrees match the filter" >&2
+    exit 0
+  fi
+
+  case "$mode" in
+    list)
+      if [[ "$FORMAT" == "tsv" ]]; then
+        # Stable column header, then one row per worktree.
+        printf 'repo\twt\tpath\tbranch\tdirty\tpr_num\tpr_state\ttmux_state\tcommit_ts\tmtime\n'
+        while IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime; do
+          [[ -z "$repo" ]] && continue
+          local st; st=$(session_state_for_path "$path")
+          printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$repo" "$wt_name" "$path" "$branch" "$dirty" "$pr_num" "$pr_state" "${st:-}" "$commit_ts" "$mtime"
+        done <<<"$sorted"
+        return
+      fi
+      if [[ "$FORMAT" == "json" ]]; then
+        # Build a JSON array. Use jq for proper escaping.
+        if ! command -v jq >/dev/null; then
+          echo "jq not installed — install with: brew install jq" >&2
+          exit 1
+        fi
+        local first=1
+        printf '['
+        while IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime; do
+          [[ -z "$repo" ]] && continue
+          local st; st=$(session_state_for_path "$path")
+          (( first )) || printf ','
+          first=0
+          jq -nc \
+            --arg repo "$repo" --arg wt "$wt_name" --arg path "$path" \
+            --arg branch "$branch" --argjson dirty "$dirty" \
+            --arg pr_num "$pr_num" --arg pr_state "$pr_state" \
+            --arg tmux_state "${st:-}" \
+            --argjson commit_ts "${commit_ts:-0}" --argjson mtime "${mtime:-0}" \
+            '{repo:$repo, wt:$wt, path:$path, branch:$branch,
+              dirty:($dirty==1), pr:(if $pr_num=="" then null
+                                      else {number:($pr_num|tonumber), state:$pr_state} end),
+              tmux:($tmux_state // null), commit_ts:$commit_ts, mtime:$mtime}'
+        done <<<"$sorted"
+        printf ']\n'
+        return
+      fi
+      local last_repo="" state
+      printf '%s\n' "$sorted" | while IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime; do
+        if [[ "$repo" != "$last_repo" ]]; then
+          [[ -n "$last_repo" ]] && printf '\n'
+          printf '%s%s%s%s\n' "$C_BLD" "$C_CYN" "$repo" "$C_RST"
+          last_repo="$repo"
+        fi
+        state=$(session_state_for_path "$path")
+        format_row "$wt_name" "$branch" "$dirty" "$pr_num" "$pr_state" "$commit_ts" "$mtime" "$now" "$state"
+        printf '\n'
+      done
+      ;;
+    pick|all)
+      local state
+      # If user passed substrings and exactly one row matched, just launch it.
+      if (( ${#substrs[@]} > 0 )) && [[ "$(printf '%s\n' "$sorted" | wc -l | tr -d ' ')" == "1" ]]; then
+        IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime <<<"$sorted"
+        launch "$path" "$repo" "$wt_name"
+        return
+      fi
+      if ! command -v fzf >/dev/null; then
+        echo "fzf not installed — install with: brew install fzf" >&2
+        exit 1
+      fi
+      tui "$sorted" "$now"
+      ;;
+    restore)
+      local r_bound=0 r_open=0 r_dryrun=0
+      for a in $PRUNE_OPTS; do
+        case "$a" in
+          --dry-run|-n) r_dryrun=1 ;;
+        esac
+      done
+      for a in $RESTORE_OPTS; do
+        case "$a" in
+          --bound)    r_bound=1 ;;
+          --open-prs) r_open=1 ;;
+        esac
+      done
+
+      # 1) Reattach detached tmux sessions in iTerm tabs (tmux-reopen behavior).
+      local detached
+      detached=$(tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
+                 | awk '$2 == 0 { print $1 }')
+      if [[ -n "$detached" ]]; then
+        printf '%sreattach detached tmux sessions%s\n' "$C_BLD" "$C_RST"
+        while IFS= read -r sess; do
+          [[ -z "$sess" ]] && continue
+          printf '  %s%s%s\n' "$C_GRN" "$sess" "$C_RST"
+          if (( r_dryrun == 0 )); then
+            osascript <<EOF >/dev/null
+tell application "iTerm"
+  tell current window
+    create tab with default profile
+    tell current session to write text "tmux attach -t '$sess'"
+  end tell
+end tell
+EOF
+          fi
+        done <<<"$detached"
+      else
+        printf '%sno detached tmux sessions%s\n' "$C_DIM" "$C_RST"
+      fi
+
+      # 2) Open new iTerm tabs for rq-bound worktrees not already in tmux.
+      printf '\n%sopen rq-bound worktrees%s\n' "$C_BLD" "$C_RST"
+      local opened=0 skipped_live=0 skipped_unbound=0
+      while IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime; do
+        [[ -z "$repo" ]] && continue
+        local st bind sess
+        st=$(session_state_for_path "$path")
+        if [[ -n "$st" ]]; then
+          skipped_live=$((skipped_live+1))
+          continue
+        fi
+        if (( r_open )) && [[ "$pr_state" != "OPEN" ]]; then
+          continue
+        fi
+        bind=$(worktree_is_bound "$path")
+        if (( r_bound )) && [[ -z "$bind" ]]; then
+          skipped_unbound=$((skipped_unbound+1))
+          continue
+        fi
+        sess=$(session_name "$repo" "$wt_name")
+        local label="${bind:-${pr_state:-no-PR}}"
+        printf '  %s+%s %s/%s  (%s)\n' "$C_GRN" "$C_RST" "$repo" "$wt_name" "$label"
+        if (( r_dryrun == 0 )); then
+          # Spawn detached tmux first so the iTerm tab just attaches.
+          local cmd="$CLAUDE_BIN ${LAUNCH_FLAGS[*]}"
+          tmux new-session -d -s "$sess" -c "$path" "$cmd" 2>/dev/null || true
+          osascript <<EOF >/dev/null
+tell application "iTerm"
+  tell current window
+    create tab with default profile
+    tell current session to write text "tmux attach -t '$sess'"
+  end tell
+end tell
+EOF
+        fi
+        opened=$((opened+1))
+      done <<<"$sorted"
+
+      printf '\n%sopened=%d  skipped(live)=%d  skipped(unbound)=%d%s\n' \
+        "$C_BLD" "$opened" "$skipped_live" "$skipped_unbound" "$C_RST"
+      ;;
+    prune)
+      local auto=0 force=0 dryrun=0
+      for a in $PRUNE_OPTS; do
+        case "$a" in
+          --yes|-y) auto=1 ;;
+          --force|-f) force=1 ;;
+          --dry-run|-n) dryrun=1 ;;
+        esac
+      done
+      local now stale_secs=$((7*24*3600)) cutoff
+      now=$(date +%s)
+      cutoff=$((now - stale_secs))
+      local pruned=0 skipped=0
+      printf '%s\n' "$rows" | while IFS='|' read -r repo wt_name path branch dirty pr_num pr_state commit_ts mtime; do
+        local last reason="" merged=0 idle="" st
+        last="${commit_ts:-0}"
+        st=$(session_state_for_path "$path")
+        if [[ "$pr_state" == "MERGED" ]]; then
+          reason="PR#${pr_num} merged"
+          merged=1
+        elif [[ "$pr_state" == "CLOSED" && "$last" != "0" && "$last" -lt "$cutoff" ]]; then
+          reason="PR#${pr_num} closed + stale"
+        elif [[ -z "$pr_state" && "$last" != "0" && "$last" -lt "$cutoff" ]]; then
+          reason="no PR + stale ($(( (now-last)/86400 ))d)"
+        elif [[ "$dirty" == "0" && -z "$pr_state" && -z "$st" ]]; then
+          reason="clean + no PR + no live session"
+          idle=1
+        else
+          continue
+        fi
+        # Skip if a tmux/claude session is using this worktree (don't yank it).
+        if [[ -n "$st" ]]; then
+          printf '%sSKIP live%s   %-22s %-40s  %s (%s)\n' \
+            "$C_YLW" "$C_RST" "$repo" "$wt_name" "$reason" "$st"
+          skipped=$((skipped+1))
+          continue
+        fi
+        # Dirty rule: skip dirty unless --force, OR the PR is merged (work landed).
+        if [[ "$dirty" == "1" && "$force" != "1" && "$merged" != "1" ]]; then
+          printf '%sSKIP dirty%s  %-22s %-40s  %s\n' "$C_YLW" "$C_RST" "$repo" "$wt_name" "$reason"
+          skipped=$((skipped+1))
+          continue
+        fi
+        printf '%s%-22s %-40s  %s%s\n' "$C_DIM" "$repo" "$wt_name" "$reason" "$C_RST"
+        if [[ "$dryrun" == "1" ]]; then
+          printf '    %swould remove%s %s\n' "$C_DIM" "$C_RST" "$path"
+          continue
+        fi
+        local ok="y"
+        if [[ "$auto" != "1" ]]; then
+          read -rp "  remove $path ? [y/N/q] " ok < /dev/tty || ok="n"
+          [[ "$ok" == "q" ]] && break
+        fi
+        if [[ "$ok" == "y" || "$ok" == "Y" ]]; then
+          local repo_root="$ROOT/$repo" out rc
+          local -a flags=()
+          [[ "$dirty" == "1" ]] && flags+=(--force)
+          out=$(git -C "$repo_root" worktree remove "${flags[@]}" "$path" 2>&1) && rc=0 || rc=$?
+          if (( rc != 0 )) && grep -q 'locked' <<<"$out"; then
+            echo "    locked — unlocking + force remove"
+            git -C "$repo_root" worktree unlock "$path" 2>&1 | sed 's/^/    /' || true
+            out=$(git -C "$repo_root" worktree remove --force "$path" 2>&1) && rc=0 || rc=$?
+          fi
+          [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/    /'
+          (( rc == 0 )) && pruned=$((pruned+1))
+        fi
+      done
+      printf '%sdone%s\n' "$C_GRN" "$C_RST"
+      ;;
+  esac
+}
+
+main "$@"
