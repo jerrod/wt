@@ -2,7 +2,7 @@
 
 A fast, opinionated CLI + TUI for managing per-feature [Claude Code](https://docs.claude.com/en/docs/claude-code) git worktrees.
 
-It scans every `.claude/worktrees/<name>` directory under `~/Sites`, joins each one against:
+It scans every `.claude/worktrees/<name>` directory under `$SITES_ROOT` (default `$HOME/Sites`), joins each one against:
 
 - the repo's GitHub PRs (one cached `gh pr list` per repo)
 - the live `tmux` session graph (which panes are in which worktree)
